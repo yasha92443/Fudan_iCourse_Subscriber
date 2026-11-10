@@ -1,0 +1,86 @@
+name: iCourse Login Check
+
+# Authentication only. Never runs the subscriber, reads courses, or sends mail.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: icourse-login-check
+  cancel-in-progress: false
+
+jobs:
+  login:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install authentication dependencies only
+        run: python -m pip install requests==2.32.5 pycryptodome==3.23.0
+      - name: Verify authentication without processing courses
+        env:
+          StuId: ${{ secrets.STUID }}
+          UISPsw: ${{ secrets.UISPSW }}
+          UIS_TOTP_SECRET: ${{ secrets.UIS_TOTP_SECRET }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import contextlib
+          import os
+          import sys
+
+          # Do not echo library output, exception messages, URLs, or response data.
+          # Existing authentication errors can contain redirect query parameters.
+          class Discard:
+              def write(self, value):
+                  return len(value)
+              def flush(self):
+                  pass
+
+          def verify():
+              required = ("StuId", "UISPsw", "UIS_TOTP_SECRET")
+              if any(not os.environ.get(key, "").strip() for key in required):
+                  return "FAILED: configure STUID, UISPSW, and UIS_TOTP_SECRET repository secrets.", 1
+              stage = "initialization"
+              vpn = None
+              try:
+                  with contextlib.redirect_stdout(Discard()), contextlib.redirect_stderr(Discard()):
+                      from src.api.webvpn import WebVPNSession
+                      from src.runtime import config
+                      vpn = WebVPNSession()
+                      stage = "WebVPN authentication"
+                      vpn.login()
+                      stage = "iCourse authentication"
+                      vpn.authenticate_icourse()
+                      stage = "authenticated user verification"
+                      response = vpn.get(config.ICOURSE_BASE + "/userapi/v1/infosimple", timeout=30)
+                      response.raise_for_status()
+                      payload = response.json()
+                      # authenticate_icourse() alone may return True on failed verification.
+                      if not isinstance(payload, dict) or payload.get("code") not in (0, 200):
+                          raise ValueError("verification failed")
+                      user = payload.get("params") or payload.get("data")
+                      if not isinstance(user, dict) or not user.get("id"):
+                          raise ValueError("authenticated user identity missing")
+              except Exception:
+                  return "FAILED at " + stage + ". No response or credentials were logged; no automatic retry.", 1
+              finally:
+                  if vpn is not None:
+                      with contextlib.redirect_stdout(Discard()), contextlib.redirect_stderr(Discard()):
+                          try:
+                              vpn.session.close()
+                          except Exception:
+                              pass
+              return "PASS: WebVPN and iCourse authenticated; user identity verified. No courses processed.", 0
+
+          message, status = verify()
+          print(message)
+          sys.exit(status)
+          PY
